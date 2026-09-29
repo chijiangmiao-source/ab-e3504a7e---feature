@@ -1,10 +1,13 @@
 """HTTP API for the deep-space timestamp audit service (stdlib only).
 
 Endpoints:
-    GET  /health          liveness probe
-    POST /audits          create an audit (idempotent on request_id)
-    GET  /audits          list audit ids
-    GET  /audits/{id}     read the frozen input, conclusion and evidence
+    GET    /health                     liveness probe
+    POST   /audits                     create an audit (idempotent on request_id)
+    GET    /audits                     list audit ids
+    GET    /audits/{id}                read the frozen input, conclusion and evidence
+    POST   /audits/{id}/repairs        submit a counter repair for an unsat audit
+    GET    /audits/{id}/repairs        list repairs recorded against an audit
+    GET    /repairs/{rid}              read a frozen repair record
 """
 
 from __future__ import annotations
@@ -15,10 +18,19 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from .repair import validate_repair_request
 from .solver import InputError
-from .store import AuditStore, ConflictError
+from .store import (
+    AuditStore,
+    ConflictError,
+    RepairConflictError,
+    SourceNotRepairable,
+)
 
 _AUDIT_PATH = re.compile(r"^/audits/([A-Za-z0-9][A-Za-z0-9_-]*)$")
+_AUDIT_REPAIRS_PATH = re.compile(
+    r"^/audits/([A-Za-z0-9][A-Za-z0-9_-]*)/repairs$")
+_REPAIR_PATH = re.compile(r"^/repairs/([A-Za-z0-9][A-Za-z0-9_-]*)$")
 
 
 class _BadBody(Exception):
@@ -64,6 +76,28 @@ class Handler(BaseHTTPRequestHandler):
                 "count": self.store.count(),
                 "audits": self.store.ids(),
             })
+        repairs_match = _AUDIT_REPAIRS_PATH.match(path)
+        if repairs_match:
+            record = self.store.get(repairs_match.group(1))
+            if record is None:
+                return self._send_json(404, {
+                    "error": "not_found",
+                    "message": f"no audit {repairs_match.group(1)}",
+                })
+            return self._send_json(200, {
+                "audit_id": record["audit_id"],
+                "count": len(self.store.repair_ids_for(record["audit_id"])),
+                "repairs": self.store.repair_ids_for(record["audit_id"]),
+            })
+        repair_match = _REPAIR_PATH.match(path)
+        if repair_match:
+            record = self.store.get_repair(repair_match.group(1))
+            if record is None:
+                return self._send_json(404, {
+                    "error": "not_found",
+                    "message": f"no repair {repair_match.group(1)}",
+                })
+            return self._send_json(200, record)
         match = _AUDIT_PATH.match(path)
         if match:
             record = self.store.get(match.group(1))
@@ -77,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
+        repairs_match = _AUDIT_REPAIRS_PATH.match(path)
+        if repairs_match:
+            return self._post_repair(repairs_match.group(1))
         if path != "/audits":
             return self._send_json(404, {"error": "not_found"})
         try:
@@ -103,6 +140,52 @@ class Handler(BaseHTTPRequestHandler):
         body = dict(record)
         body["replayed"] = not created
         return self._send_json(201 if created else 200, body)
+
+    def _post_repair(self, audit_id):
+        source = self.store.get(audit_id)
+        if source is None:
+            return self._send_json(404, {
+                "error": "not_found",
+                "message": f"no audit {audit_id}",
+            })
+        try:
+            body = self._read_json()
+        except _BadBody:
+            return self._send_json(400, {
+                "error": "bad_json",
+                "message": "request body is not valid JSON",
+            })
+        try:
+            req = validate_repair_request(body, source["input"]["modulus"])
+        except InputError as exc:
+            return self._send_json(400, {
+                "error": "invalid_input",
+                "problems": exc.problems,
+            })
+        try:
+            record, created = self.store.create_repair(audit_id, req)
+        except RepairConflictError as exc:
+            return self._send_json(409, {
+                "error": "fix_id_conflict",
+                "message": (
+                    "fix_id was already used on "
+                    f"{exc.source_audit_id} with K={exc.K}; a different "
+                    "source audit or K is rejected and no record changed"),
+                "existing_repair_id": exc.repair_id,
+                "bound_source_audit_id": exc.source_audit_id,
+                "bound_K": exc.K,
+            })
+        except SourceNotRepairable as exc:
+            return self._send_json(409, {
+                "error": "source_not_unsatisfiable",
+                "message": (
+                    "counter repairs are only accepted against an "
+                    f"unsatisfiable audit; source status is {exc.status}"),
+                "source_status": exc.status,
+            })
+        out = dict(record)
+        out["replayed"] = not created
+        return self._send_json(201 if created else 200, out)
 
 
 def make_server(host, port, store=None):

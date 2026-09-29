@@ -3,10 +3,12 @@
 Runs three gates and reports the outcome through the process exit code:
 
 1. build check -- every Python source compiles;
-2. code tests  -- the unit-test suite (solver, store, API);
+2. code tests  -- the unit-test suite (solver, repair search, store, API);
 3. API smoke   -- HTTP checks against a live service at APP_URL covering the
    reference unwrap (B=103), the ambiguous twin timelines, the bidirectional
-   conflict chain, and idempotent record creation.
+   conflict chain, idempotent record creation, counter repairs (cross-wrap
+   correction, global-optimum tie adjudication, within-budget exhaustion),
+   repair idempotency and a legacy-audit regression pass.
 
 Exit code 0 means every check passed.
 """
@@ -26,6 +28,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8080").rstrip("/")
 
 RESULTS = []
+
+# unique per process so re-running the harness against a long-lived service
+# exercises fresh 201 creation rather than idempotent 200 replay
+RUN_ID = str(int(time.time() * 1000))[-10:]
+
+
+def rid(value):
+    return f"{value}-{RUN_ID}"
 
 
 def check(name, ok, detail=""):
@@ -82,7 +92,7 @@ def gate_tests():
 # ---------------------------------------------------------------------------
 
 UNIQUE_PAYLOAD = {
-    "request_id": "smoke-unique-1",
+    "request_id": rid("smoke-unique-1"),
     "modulus": 100,
     "anchor": {"id": "A", "absolute": 95},
     "events": [{"id": "B", "counter": 3}],
@@ -92,7 +102,7 @@ UNIQUE_PAYLOAD = {
 }
 
 AMBIGUOUS_PAYLOAD = {
-    "request_id": "smoke-ambiguous-1",
+    "request_id": rid("smoke-ambiguous-1"),
     "modulus": 100,
     "anchor": {"id": "A", "absolute": 95},
     "events": [{"id": "B", "counter": 3}, {"id": "C", "counter": 50}],
@@ -103,7 +113,60 @@ AMBIGUOUS_PAYLOAD = {
 }
 
 CONFLICT_PAYLOAD = {
-    "request_id": "smoke-conflict-1",
+    "request_id": rid("smoke-conflict-1"),
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 95},
+    "events": [{"id": "B", "counter": 3}],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": 8, "hi": 8},
+        {"id": "c2", "source": "B", "target": "A", "lo": -108, "hi": -108},
+    ],
+}
+
+# counter reading is off by one tick on the wrap boundary
+REPAIR_CROSS_PAYLOAD = {
+    "request_id": rid("smoke-repair-cross"),
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 95},
+    "events": [{"id": "B", "counter": 4}],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": 8, "hi": 8},
+    ],
+}
+
+# (-1, 0) and (0, +1) are tied global optima at (1 changed, 1 tick)
+REPAIR_TIE_PAYLOAD = {
+    "request_id": rid("smoke-repair-tie"),
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 0},
+    "events": [
+        {"id": "B", "counter": 16},
+        {"id": "C", "counter": 3},
+    ],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": -12, "hi": 25},
+        {"id": "c2", "source": "B", "target": "C", "lo": 88, "hi": 139},
+    ],
+}
+
+# 1 event x 2 ticks must beat 2 events x 1 tick (changed count dominates)
+REPAIR_PRIORITY_PAYLOAD = {
+    "request_id": rid("smoke-repair-prio"),
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 150},
+    "events": [
+        {"id": "B", "counter": 82},
+        {"id": "C", "counter": 87},
+    ],
+    "constraints": [
+        {"id": "c1", "source": "B", "target": "C", "lo": -115, "hi": -97},
+        {"id": "c2", "source": "A", "target": "C", "lo": -12, "hi": 58},
+    ],
+}
+
+# no counter move within K=1 can break the bidirectional contradiction
+REPAIR_EXHAUST_PAYLOAD = {
+    "request_id": rid("smoke-repair-exhaust"),
     "modulus": 100,
     "anchor": {"id": "A", "absolute": 95},
     "events": [{"id": "B", "counter": 3}],
@@ -150,11 +213,11 @@ def smoke_unique_unwrap():
 
 def smoke_frozen_record():
     status, created = request("POST", "/audits",
-                              {**UNIQUE_PAYLOAD, "request_id": "smoke-frozen-1"})
+                              {**UNIQUE_PAYLOAD, "request_id": rid("smoke-frozen-1")})
     expect(status == 201, f"create returned {status}")
     status, fetched = request("GET", f"/audits/{created['audit_id']}")
     expect(status == 200, f"read returned {status}")
-    expect(fetched["input"] == {**UNIQUE_PAYLOAD, "request_id": "smoke-frozen-1"},
+    expect(fetched["input"] == {**UNIQUE_PAYLOAD, "request_id": rid("smoke-frozen-1")},
            "frozen input does not match the submitted payload")
     expect(fetched["conclusion"] == created["conclusion"],
            "frozen conclusion changed between create and read")
@@ -195,7 +258,7 @@ def smoke_conflict_chain():
 
 def smoke_idempotency():
     _, before = request("GET", "/audits")
-    payload = {**UNIQUE_PAYLOAD, "request_id": "smoke-idem-1"}
+    payload = {**UNIQUE_PAYLOAD, "request_id": rid("smoke-idem-1")}
     status, created = request("POST", "/audits", payload)
     expect(status == 201, f"create returned {status}")
 
@@ -220,7 +283,7 @@ def smoke_idempotency():
 
 def smoke_validation_and_404():
     disconnected = {
-        "request_id": "smoke-invalid-1",
+        "request_id": rid("smoke-invalid-1"),
         "modulus": 100,
         "anchor": {"id": "A", "absolute": 95},
         "events": [{"id": "B", "counter": 3}, {"id": "Z", "counter": 1}],
@@ -236,6 +299,174 @@ def smoke_validation_and_404():
     expect(status == 404, f"unknown audit returned {status}")
 
 
+def _create(payload):
+    status, body = request("POST", "/audits", payload)
+    expect(status == 201, f"create returned {status}: {body}")
+    expect(body.get("status") == "unsatisfiable",
+           f"repair source must be unsatisfiable, got {body.get('status')}")
+    return body
+
+
+def _post_repair(audit_id, fix_id, K):
+    return request("POST", f"/audits/{audit_id}/repairs",
+                   {"fix_id": fix_id, "K": K})
+
+
+def smoke_repair_cross_wrap():
+    created = _create(REPAIR_CROSS_PAYLOAD)
+    status, body = _post_repair(created["audit_id"], rid("smoke-fix-cross"), 1)
+    expect(status == 201, f"repair returned {status}: {body}")
+    expect(body.get("status") == "repaired",
+          f"repair status={body.get('status')}")
+    corrections = {c["id"]: c for c in body["canonical_corrections"]}
+    expect(corrections["B"]["tick_adjustment"] == -1,
+           f"expected tick -1, got {corrections['B']}")
+    expect(corrections["B"]["corrected_counter"] == 3,
+           "corrected reading must renormalise to 3")
+    expect(body["objective"] == {
+        "changed_events": 1, "abs_tick_sum": 1,
+        "tie_break": "lexicographically smallest vector over event ids"},
+          f"objective: {body['objective']}")
+    timeline = timeline_map(body["repaired_timeline"])
+    expect(timeline["B"]["absolute"] == 103 and timeline["B"]["wrap"] == 1,
+           f"repaired timeline: {timeline}")
+    for delta in body["constraint_deltas"]:
+        expect(delta["satisfied"] is True, f"delta not satisfied: {delta}")
+        expect(delta["interval"] == [8, 8],
+               "causal window must remain [8, 8], never widened")
+        total = delta["absolute_delta"]
+        expect(8 <= total <= 8, f"absolute delta {total} outside [8,8]")
+    # the source audit itself is untouched
+    status, fetched = request("GET", f"/audits/{created['audit_id']}")
+    expect(fetched["status"] == "unsatisfiable",
+           "source audit must stay unsatisfiable after a repair")
+    expect("canonical_corrections" not in fetched,
+           "source audit must not be rewritten with repair data")
+    # repair is readable by its own id
+    status, fix = request("GET", f"/repairs/{body['repair_id']}")
+    expect(status == 200 and fix["fix_id"] == rid("smoke-fix-cross"),
+          f"repair readback failed: {status}")
+
+
+def smoke_repair_global_tie():
+    created = _create(REPAIR_TIE_PAYLOAD)
+    status, body = _post_repair(created["audit_id"], rid("smoke-fix-tie"), 1)
+    expect(status == 201, f"repair returned {status}: {body}")
+    vec = {c["id"]: c["tick_adjustment"]
+           for c in body["canonical_corrections"]}
+    expect(vec == {"B": -1, "C": 0},
+           f"tie must resolve to (-1, 0) in identifier order, got {vec}")
+    expect(body["objective"]["changed_events"] == 1
+           and body["objective"]["abs_tick_sum"] == 1,
+           f"objective: {body['objective']}")
+
+
+def smoke_repair_changed_count_first():
+    created = _create(REPAIR_PRIORITY_PAYLOAD)
+    status, body = _post_repair(created["audit_id"], rid("smoke-fix-prio"), 2)
+    expect(status == 201, f"repair returned {status}: {body}")
+    vec = {c["id"]: c["tick_adjustment"]
+           for c in body["canonical_corrections"]}
+    # (B=0, C=-2): one changed event beats the (B=1, C=-1) two-event fix
+    expect(vec == {"B": 0, "C": -2},
+           f"expected (0, -2), got {vec}")
+    expect(body["objective"]["changed_events"] == 1,
+           "changed-event count must dominate absolute tick sum")
+    expect(body["objective"]["abs_tick_sum"] == 2,
+           f"absolute tick sum: {body['objective']}")
+
+
+def smoke_repair_beyond_budget():
+    created = _create(REPAIR_EXHAUST_PAYLOAD)
+    status, body = _post_repair(created["audit_id"], rid("smoke-fix-exhaust"), 1)
+    expect(status == 201, f"repair returned {status}: {body}")
+    expect(body.get("status") == "beyond_budget",
+          f"expected beyond_budget, got {body.get('status')}")
+    tree = body["search"]["tree"]
+    removed = {}
+    for prune in tree.get("domain_pruning", []):
+        removed.setdefault(prune["event"], set()).update(
+            prune["removed_ticks"])
+    expect(removed.get("B") == {-1, 0, 1},
+           f"every tick in [-1,1] must be refuted, got {removed}")
+    witnesses = [w for prune in tree.get("domain_pruning", [])
+                 for w in prune["witnesses"]]
+    expect(witnesses, "exhaustion must carry recomputable branch evidence")
+    for w in witnesses:
+        if w["kind"] == "negative_cycle":
+            expect(w["total_weight"]
+                   == sum(s["weight"] for s in w["steps"]) < 0,
+                   "conflict-chain weights must recompute to a negative sum")
+        else:
+            expect(w["wrap_lower"] > w["wrap_upper"],
+                   "empty-wrap witness must have lower > upper")
+    # same fix_id replays; a changed K is rejected
+    status, replay = _post_repair(
+        created["audit_id"], rid("smoke-fix-exhaust"), 1)
+    expect(status == 200 and replay["replayed"] is True,
+          f"replay failed: {status} {replay.get('error')}")
+    expect(replay["repair_id"] == body["repair_id"],
+          "replay must keep the original repair id")
+    status, conflict = _post_repair(
+        created["audit_id"], rid("smoke-fix-exhaust"), 0)
+    expect(status == 409, f"changed K must return 409, got {status}")
+    expect(conflict.get("error") == "fix_id_conflict",
+          f"conflict body: {conflict}")
+
+
+def smoke_repair_validation_and_source_guard():
+    guard_source = {**REPAIR_CROSS_PAYLOAD,
+                    "request_id": rid("smoke-repair-guard-src")}
+    created = _create(guard_source)
+    status, body = _post_repair(created["audit_id"], rid("smoke-fix-bad"), 51)
+    expect(status == 400, f"K=51 must be rejected, got {status}")
+    expect(any("[0, 50]" in p for p in body.get("problems", [])),
+          f"problems must cite the half-modulus bound: {body}")
+    status, _ = request(
+        "POST", f"/audits/{created['audit_id']}/repairs",
+        {"fix_id": 9, "K": 1})
+    expect(status == 400, "non-string fix_id must be rejected")
+    # repairs against a satisfiable audit are refused
+    unique = {
+        "request_id": rid("smoke-fix-guard"),
+        "modulus": 100,
+        "anchor": {"id": "A", "absolute": 95},
+        "events": [{"id": "B", "counter": 3}],
+        "constraints": [
+            {"id": "c1", "source": "A", "target": "B", "lo": 8, "hi": 8}],
+    }
+    status, ok = request("POST", "/audits", unique)
+    expect(status == 201 and ok["status"] == "unique", "guard setup failed")
+    status, refused = _post_repair(ok["audit_id"], rid("smoke-fix-guard"), 1)
+    expect(status == 409
+           and refused.get("error") == "source_not_unsatisfiable",
+           f"repairs on satisfiable audits must be refused: {status}")
+
+
+def smoke_legacy_audit_regression():
+    # original create/read/list semantics survive unchanged after repairs
+    _, audits_before = request("GET", "/audits")
+    status, created = request("POST", "/audits", {
+        **UNIQUE_PAYLOAD, "request_id": rid("smoke-legacy-1")})
+    expect(status == 201, f"legacy create returned {status}")
+    status, fetched = request("GET", f"/audits/{created['audit_id']}")
+    expect(status == 200 and fetched["status"] == "unique",
+          "legacy read must still return the frozen unique record")
+    status, listing = request("GET", "/audits")
+    expect(listing["count"] == audits_before["count"] + 1,
+           "legacy audit list count must advance by one")
+    # an unsatisfiable record repaired earlier is byte-for-byte stable
+    status, conflict_audit = request("POST", "/audits", {
+        **CONFLICT_PAYLOAD, "request_id": rid("smoke-legacy-conflict")})
+    expect(status == 201 and conflict_audit["status"] == "unsatisfiable",
+          "legacy conflict creation must still work")
+    before = conflict_audit["conclusion"]
+    _post_repair(conflict_audit["audit_id"], rid("smoke-legacy-fix"), 1)
+    status, reread = request("GET", f"/audits/{conflict_audit['audit_id']}")
+    expect(reread["conclusion"] == before,
+           "the legacy conflict chain must be stable after a repair")
+
+
 def gate_http():
     if not wait_ready():
         check("http: service reachable", False, f"no /health from {APP_URL}")
@@ -249,6 +480,17 @@ def gate_http():
         ("http: bidirectional conflict chain", smoke_conflict_chain),
         ("http: idempotent records", smoke_idempotency),
         ("http: validation and 404", smoke_validation_and_404),
+        ("http: repair across a wrap boundary", smoke_repair_cross_wrap),
+        ("http: repair global-optimum tie adjudication",
+         smoke_repair_global_tie),
+        ("http: repair changed-count beats tick sum",
+         smoke_repair_changed_count_first),
+        ("http: repair within-budget exhaustion evidence",
+         smoke_repair_beyond_budget),
+        ("http: repair validation and source guard",
+         smoke_repair_validation_and_source_guard),
+        ("http: legacy audit semantics regression",
+         smoke_legacy_audit_regression),
     ]
     for name, fn in smokes:
         try:
