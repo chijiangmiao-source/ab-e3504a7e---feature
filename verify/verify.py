@@ -113,6 +113,30 @@ CONFLICT_PAYLOAD = {
     ],
 }
 
+# One-tick cross-wrap correction: reading 3 must be 4 so B unwraps to 104.
+REPAIR_UNSAT_PAYLOAD = {
+    "request_id": "smoke-repair-unsat-1",
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 95},
+    "events": [{"id": "B", "counter": 3}],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": 9, "hi": 9},
+    ],
+}
+
+# Global-optimum tie: with M=4, target residue 2 is reached by delta -2 or
+# +2 at identical cardinality and absolute cost; identifier-order tie-break
+# on the correction vector selects -2.
+REPAIR_TIE_PAYLOAD = {
+    "request_id": "smoke-repair-tie-1",
+    "modulus": 4,
+    "anchor": {"id": "A", "absolute": 0},
+    "events": [{"id": "B", "counter": 0}],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": 2, "hi": 2},
+    ],
+}
+
 
 def timeline_map(timeline):
     return {e["id"]: e for e in timeline}
@@ -236,6 +260,143 @@ def smoke_validation_and_404():
     expect(status == 404, f"unknown audit returned {status}")
 
 
+# ---------------------------------------------------------------------------
+# repair smokes
+# ---------------------------------------------------------------------------
+
+def smoke_repair_cross_wrap():
+    status, audit = request("POST", "/audits", REPAIR_UNSAT_PAYLOAD)
+    expect(status == 201, f"create returned {status}: {audit}")
+    expect(audit["status"] == "unsatisfiable", "repair input must be unsat")
+    path = f"/audits/{audit['audit_id']}/repairs"
+
+    status, body = request("POST", path, {"repair_id": "fix-cross", "k": 1})
+    expect(status == 201, f"repair returned {status}: {body}")
+    expect(body["status"] == "repaired", f"status={body['status']}")
+    expect(body["replayed"] is False, "first repair must not be a replay")
+    corrections = {c["id"]: c
+                   for c in body["conclusion"]["canonical_corrections"]}
+    expect(corrections["B"]["correction"] == 1,
+           f"canonical correction {corrections['B']}")
+    expect(corrections["B"]["corrected_counter"] == 4, "B must read 4")
+    expect(body["conclusion"]["changed_count"] == 1, "exactly one event moves")
+    expect(body["conclusion"]["abs_correction_sum"] == 1, "effort must be 1")
+    timeline = timeline_map(body["conclusion"]["timeline"])
+    expect(timeline["B"]["absolute"] == 104,
+           f"repaired B absolute {timeline['B']['absolute']}")
+    deltas = body["conclusion"]["constraint_deltas"]
+    expect(all(d["satisfied"] for d in deltas), "every window still satisfied")
+    expect(all(d["interval"] == [9, 9] for d in deltas),
+           "the causal window itself must not widen")
+
+    # repair is readable through its own endpoint
+    status, fetched = request("GET", f"/repairs/{body['repair_number']}")
+    expect(status == 200, f"repair read returned {status}")
+    expect(fetched["conclusion"] == body["conclusion"],
+           "frozen repair conclusion changed between create and read")
+
+
+def smoke_repair_tie():
+    status, audit = request("POST", "/audits", REPAIR_TIE_PAYLOAD)
+    expect(status == 201 and audit["status"] == "unsatisfiable",
+           f"tie audit setup failed: {status} {audit}")
+    status, body = request(
+        "POST", f"/audits/{audit['audit_id']}/repairs",
+        {"repair_id": "fix-tie", "k": 2})
+    expect(status == 201, f"repair returned {status}: {body}")
+    expect(body["status"] == "repaired", f"status={body['status']}")
+    (only,) = body["conclusion"]["canonical_corrections"]
+    expect(only["id"] == "B" and only["correction"] == -2,
+           f"tie must resolve to the smaller vector entry -2, got {only}")
+    expect(body["conclusion"]["changed_count"] == 1, "one event changed")
+    expect(body["conclusion"]["abs_correction_sum"] == 2, "cost 2 either way")
+
+
+def smoke_repair_exhausted():
+    status, audit = request("POST", "/audits",
+                            {**CONFLICT_PAYLOAD,
+                             "request_id": "smoke-repair-exhaust-1"})
+    expect(status == 201 and audit["status"] == "unsatisfiable",
+           "conflict audit must exist and be unsat")
+    # the bidirectional contradiction cannot be papered over at small k
+    status, body = request(
+        "POST", f"/audits/{audit['audit_id']}/repairs",
+        {"repair_id": "fix-none", "k": 2})
+    expect(status == 201, f"repair returned {status}: {body}")
+    expect(body["status"] == "exhausted", f"status={body['status']}")
+    ex = body["conclusion"]["exhausted"]
+    expect(ex["complete_proof"] is True, "small domain must exhaust completely")
+    expect(ex["sample_branches"], "exhaustion must carry branch evidence")
+    for sample in ex["sample_branches"]:
+        chain = sample.get("conflict_chain")
+        expect(chain is not None, "sample branch must carry a conflict chain")
+        total = sum(step["weight"] for step in chain["steps"])
+        expect(chain["total_weight"] == total,
+               "chain weights must recompute to the reported total")
+        expect(total < 0, "exhaustion chain must close negative")
+        expect(chain["cycle"][0] == chain["cycle"][-1], "chain must be a cycle")
+
+
+def smoke_repair_idempotency():
+    status, audit = request("POST", "/audits",
+                            {**REPAIR_UNSAT_PAYLOAD,
+                             "request_id": "smoke-repair-idem-1"})
+    expect(status == 201, f"create returned {status}")
+    path = f"/audits/{audit['audit_id']}/repairs"
+
+    status, first = request("POST", path, {"repair_id": "fix-idem", "k": 1})
+    expect(status == 201, f"repair returned {status}")
+
+    status, replay = request("POST", path, {"repair_id": "fix-idem", "k": 1})
+    expect(status == 200, f"replay returned {status}")
+    expect(replay["replayed"] is True, "replay must be flagged")
+    expect(replay["repair_number"] == first["repair_number"],
+           "replay must return the original repair number")
+
+    status, changed_k = request(
+        "POST", path, {"repair_id": "fix-idem", "k": 2})
+    expect(status == 409, f"changed k returned {status}, expected 409")
+    expect(changed_k["error"] == "repair_id_conflict",
+           f"unexpected error {changed_k}")
+    expect(changed_k["existing_repair_number"] == first["repair_number"],
+           "409 must reference the original repair")
+
+    # source audit lists only the one repair
+    status, fetched = request("GET", f"/audits/{audit['audit_id']}")
+    expect(fetched["repairs"] == [first["repair_number"]],
+           f"repair listing after conflict: {fetched.get('repairs')}")
+    expect(fetched["status"] == "unsatisfiable",
+           "failed/conflicting repairs must not rewrite the source audit")
+
+
+def smoke_repair_guards():
+    # repairs only apply to unsatisfiable audits
+    status, unique = request("POST", "/audits",
+                             {**UNIQUE_PAYLOAD, "request_id": "smoke-repair-guard"})
+    expect(status == 201, f"create returned {status}")
+    status, body = request(
+        "POST", f"/audits/{unique['audit_id']}/repairs",
+        {"repair_id": "fix-guard", "k": 1})
+    expect(status == 409, f"repair on unique audit returned {status}")
+    expect(body["error"] == "audit_not_unsatisfiable", f"body: {body}")
+
+    # k above M//2 is rejected and claims no repair id
+    status, audit = request("POST", "/audits",
+                            {**REPAIR_UNSAT_PAYLOAD,
+                             "request_id": "smoke-repair-guard-k"})
+    expect(status == 201, f"create returned {status}")
+    status, body = request(
+        "POST", f"/audits/{audit['audit_id']}/repairs",
+        {"repair_id": "fix-guard-k", "k": 51})
+    expect(status == 400, f"k=51 returned {status}")
+    expect(body["error"] == "invalid_repair", f"body: {body}")
+    expect(body["problems"], "400 must explain the rejected k")
+
+    status, missing = request("POST", "/audits/AUD-999999/repairs",
+                              {"repair_id": "fix-x", "k": 1})
+    expect(status == 404, f"unknown audit returned {missing}")
+
+
 def gate_http():
     if not wait_ready():
         check("http: service reachable", False, f"no /health from {APP_URL}")
@@ -249,6 +410,11 @@ def gate_http():
         ("http: bidirectional conflict chain", smoke_conflict_chain),
         ("http: idempotent records", smoke_idempotency),
         ("http: validation and 404", smoke_validation_and_404),
+        ("http: cross-wrap counter repair", smoke_repair_cross_wrap),
+        ("http: global-optimum tie verdict", smoke_repair_tie),
+        ("http: in-budget exhaustion evidence", smoke_repair_exhausted),
+        ("http: repair replay and conflicts", smoke_repair_idempotency),
+        ("http: repair guards source audit", smoke_repair_guards),
     ]
     for name, fn in smokes:
         try:

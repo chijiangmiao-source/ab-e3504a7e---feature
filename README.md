@@ -35,7 +35,9 @@ k_t − k_s ∈ [ ⌈(lo − (c_t − c_s)) / M⌉ ,  ⌊(hi − (c_t − c_s)) 
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/audits` | 创建审计（对 `request_id` 幂等） |
 | `GET` | `/audits` | 列出审计编号与数量 |
-| `GET` | `/audits/{id}` | 读取冻结的输入、结论与证据 |
+| `GET` | `/audits/{id}` | 读取冻结的输入、结论、证据与该审计的修复编号 |
+| `POST` | `/audits/{id}/repairs` | 对无解审计提交计数修复（对 `repair_id` 幂等） |
+| `GET` | `/repairs/{number}` | 读取冻结的修复记录 |
 
 ### 创建示例
 
@@ -58,6 +60,49 @@ curl -X POST localhost:${HOST_PORT:-8080}/audits -d '{
 - 相同 `request_id` + 改换任一事件或约束 → `409`，**不新增记录**；
 - 载荷非法 → `400`（`problems` 列出全部问题），不占用 `request_id`。
 
+## 计数修复（仅针对 `unsatisfiable` 审计）
+
+读取一条结论为无解的既有审计后，可提交修复标识 `repair_id` 与统一读数校正上限
+`K`（整数，`0 ≤ K ≤ ⌊M/2⌋`），在**不放宽任何因果窗口**的前提下修正设备计数：
+
+- 来源输入与 `K` 一并冻结；锚点不可改，只允许把每个事件计数加上整数 tick
+  `delta ∈ [-K, K]`，再按模数归一 `counter' = (counter + delta) mod M`；
+- 校正选择与回绕整数差分约束**共同搜索**（不是先选校正再解，也不逐条贪心），
+  以冲突链驱动下界与剪枝，不枚举全部校正向量、不使用浮点近似；
+- 三级目标，依次比较：
+  1. 被改动事件数最少（`delta != 0` 的个数）；
+  2. 校正绝对值之和 `Σ|delta|` 最小；
+  3. 仍并列时，取按事件标识序的校正向量（字典序，候选顺序
+     `0, +1, -1, +2, -2, …`）。
+
+成功（`status: "repaired"`，`201`）返回：
+
+- `canonical_corrections`：逐事件原始读数、校正 tick、归一后读数；
+- `timeline`：修正后计数展开的规范时间线；
+- `constraint_deltas`：逐约束的计数残差、回绕界 `[lo_k, hi_k]`、回绕差分、
+  绝对差分与 `satisfied`（窗口区间保持原值，可逐项复算）；
+- `changed_count` / `abs_correction_sum` 与搜索证据（节点数、剪枝计数、
+  `complete: true`）。
+
+预算内仍无解（`status: "exhausted"`，同样 `201` 并冻结）返回**可复算的耗尽
+分支证据**：校正域、剪枝原因统计，以及采样冲突分支——每条冲突链给出环上整数
+权重，其总和可复算且 `< 0`。达到确定性节点预算时 `complete_proof: false`，
+此时即便遇到可行向量也只作为 `uncertified_incumbent` 展示，绝不当作最优解。
+
+### 修复幂等语义
+
+- 相同 `repair_id` + 相同来源审计 + 相同 `K` → `200`，返回**原修复编号**
+  （`FIX-000001`…），`replayed: true`；
+- 相同 `repair_id` 但**换来源审计或改 `K`** → `409`，不新增修复、**不改写来源
+  审计**（其冻结输入/结论/证据保持 `unsatisfiable`）；
+- 对非 `unsatisfiable` 审计提交修复 → `409`；来源不存在 → `404`；
+- 修复体非法（如 `K > M//2`）→ `400`，不占用 `repair_id`。
+
+```bash
+curl -X POST localhost:${HOST_PORT:-8080}/audits/AUD-000001/repairs \
+  -d '{"repair_id": "fix-1", "k": 1}'
+```
+
 ## 运行
 
 ### 本地
@@ -78,9 +123,11 @@ curl localhost:9090/health
 `verify` 是执行后即退出的一次性服务，依次执行：
 
 1. **构建检查**：全部源码编译；
-2. **代码测试**：求解器/存储/API 单元测试；
+2. **代码测试**：求解器/修复/存储/API 单元测试；
 3. **API/HTTP 冒烟**：参考展开（B=103）、歧义双时间线与首个不稳定先后关系、
-   双向矛盾链（权重可复算且 `< 0`）、幂等记录（重放/冲突/不新增）。
+   双向矛盾链（权重可复算且 `< 0`）、幂等记录（重放/冲突/不新增），以及
+   跨回绕计数修复、全局最优并列裁决、预算内无解的可复算证据、
+   修复幂等（重放/换来源或改 K 拒绝/来源审计不被改写）。
 
 ```bash
 docker compose up --build --exit-code-from verify --abort-on-container-exit verify

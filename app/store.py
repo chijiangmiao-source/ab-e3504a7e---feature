@@ -14,6 +14,7 @@ import json
 import threading
 from datetime import datetime, timezone
 
+from .repair import normalize_repair, solve_repair
 from .solver import normalize, solve
 
 
@@ -23,6 +24,31 @@ class ConflictError(Exception):
     def __init__(self, audit_id):
         self.audit_id = audit_id
         super().__init__(f"request_id already bound to {audit_id}")
+
+
+class RepairConflictError(Exception):
+    """repair_id was already used with a different source audit or k."""
+
+    def __init__(self, repair_number, audit_id):
+        self.repair_number = repair_number
+        self.audit_id = audit_id
+        super().__init__(
+            f"repair_id already bound to {repair_number} on {audit_id}")
+
+
+class AuditNotRepairableError(Exception):
+    """Only audits concluded unsatisfiable can be repaired."""
+
+    def __init__(self, audit_id, status):
+        self.audit_id = audit_id
+        self.status = status
+        super().__init__(f"audit {audit_id} is {status}, not unsatisfiable")
+
+
+class UnknownAuditError(Exception):
+    def __init__(self, audit_id):
+        self.audit_id = audit_id
+        super().__init__(f"no audit {audit_id}")
 
 
 def canonical_form(payload):
@@ -44,6 +70,10 @@ class AuditStore:
         self._audits = {}      # audit_id -> frozen record
         self._order = []       # audit ids in creation order
         self._seq = 0
+        self._by_repair = {}   # repair_id -> (fingerprint, repair_number)
+        self._repairs = {}     # repair_number -> frozen repair record
+        self._audit_repairs = {}  # audit_id -> [repair_number]
+        self._repair_seq = 0
 
     def create(self, payload):
         """Return (record, created). Raises InputError or ConflictError."""
@@ -71,10 +101,71 @@ class AuditStore:
             self._by_request[norm["request_id"]] = (fingerprint, audit_id)
             self._audits[audit_id] = record
             self._order.append(audit_id)
+            self._audit_repairs[audit_id] = []
             return record, True
+
+    def create_repair(self, audit_id, body):
+        """Create (or replay) a counter-correction repair on a frozen audit.
+
+        Returns ``(record, created)``.  The source audit is reopened
+        read-only: its frozen input, conclusion and evidence are never
+        rewritten.  A repair_id replayed with the same source audit and k
+        returns the original repair record; a different source audit or k is
+        rejected with RepairConflictError and adds nothing.
+        """
+        with self._lock:
+            source = self._audits.get(audit_id)
+            if source is None:
+                raise UnknownAuditError(audit_id)
+            if source["status"] != "unsatisfiable":
+                raise AuditNotRepairableError(audit_id, source["status"])
+
+            # Re-normalize the frozen input: it was validated at creation, so
+            # this only rebuilds the solver-ready structure.
+            norm = normalize(source["input"])
+            req = normalize_repair(body, norm)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"audit_id": audit_id, "k": req.k},
+                    sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
+            prior = self._by_repair.get(req.repair_id)
+            if prior is not None:
+                if prior[0] == fingerprint:
+                    return self._repairs[prior[1]], False
+                raise RepairConflictError(prior[1], self._repair_audit(prior[1]))
+
+            status, conclusion, evidence = solve_repair(req)
+            self._repair_seq += 1
+            number = f"FIX-{self._repair_seq:06d}"
+            record = {
+                "repair_number": number,
+                "repair_id": req.repair_id,
+                "audit_id": audit_id,
+                "request_id": source["request_id"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "k": req.k,
+                "status": status,
+                "conclusion": conclusion,
+                "evidence": evidence,
+            }
+            self._by_repair[req.repair_id] = (fingerprint, number)
+            self._repairs[number] = record
+            self._audit_repairs[audit_id].append(number)
+            return record, True
+
+    def _repair_audit(self, number):
+        return self._repairs[number]["audit_id"]
 
     def get(self, audit_id):
         return self._audits.get(audit_id)
+
+    def get_repair(self, number):
+        return self._repairs.get(number)
+
+    def repair_numbers(self, audit_id):
+        return list(self._audit_repairs.get(audit_id, ()))
 
     def ids(self):
         return list(self._order)
